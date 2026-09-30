@@ -250,6 +250,56 @@ class GatewayNotificationsMixin:
             return None
         return target_session_id
 
+    async def _resolve_delegate_completion_owner(self, session_id: str) -> tuple[str, str, Optional[Dict[str, Any]]]:
+        """Read-only provenance shared by preflight and route resolution.
+
+        Invalid/missing provenance is terminal; failed DB reads are retryable.
+        Never mutate the route or fall back to an unverified current owner.
+        """
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return "retry", session_id, None
+        seen: set[str] = set()
+        for hop in range(_MAX_DELEGATE_PROVENANCE_HOPS + 1):
+            if session_id in seen:
+                logger.warning("Cyclic delegate completion provenance at %s; dropping injection.", session_id)
+                return "terminal", session_id, None
+            seen.add(session_id)
+            try:
+                row = await session_db.get_session(session_id)
+            except Exception:
+                logger.debug("Delegate completion owner lookup failed for %s", session_id, exc_info=True)
+                return "retry", session_id, None
+            if row is None:
+                logger.warning("Missing delegate completion owner %s; dropping injection.", session_id)
+                return "terminal", session_id, None
+            config = row.get("model_config")
+            if isinstance(config, str):
+                try:
+                    config = json.loads(config)
+                except (TypeError, ValueError):
+                    logger.warning("Malformed delegate completion provenance at %s; dropping injection.", session_id)
+                    return "terminal", session_id, None
+            if config is not None and not isinstance(config, dict):
+                logger.warning("Non-object delegate completion provenance at %s; dropping injection.", session_id)
+                return "terminal", session_id, None
+            if not config or "_delegate_from" not in config:
+                if row.get("source") == "subagent":
+                    logger.warning("Delegate completion row %s has no parent marker; dropping injection.", session_id)
+                    return "terminal", session_id, None
+                return "deliver", session_id, row
+            marker = config["_delegate_from"]
+            if not isinstance(marker, str) or not marker.strip():
+                logger.warning("Invalid delegate completion parent marker at %s; dropping injection.", session_id)
+                return "terminal", session_id, None
+            parent_id = marker.strip()
+            if hop == _MAX_DELEGATE_PROVENANCE_HOPS:
+                logger.warning("Delegate completion exceeded %d provenance hops; dropping injection.",
+                               _MAX_DELEGATE_PROVENANCE_HOPS)
+                return "terminal", session_id, None
+            session_id = parent_id
+        return "terminal", session_id, None
+
     async def _resolve_async_delegation_session(
         self, session_entry: SessionEntry, pinned_session_id: str,
     ) -> Optional[SessionEntry]:
@@ -275,77 +325,12 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed)."
             )
             return None
-        pinned_row = None
-        # Snapshot the run generation before the row lookup awaits: a /stop or /new landing while
-        # the lookup is pending must not let this completion re-point the route afterwards.
+        # Capture the generation before provenance resolution awaits; /stop or /new wins.
         run_generation = self._current_session_run_generation(session_entry.session_key)
-        try:
-            pinned_row = await session_db.get_session(pinned_session_id)
-        except Exception:
-            logger.debug("Async-delegation parent lookup failed for %s", pinned_session_id, exc_info=True)
-        if pinned_row is None:
-            logger.warning(
-                "Async-delegation completion has unknown spawning session %s; "
-                "dropping injection (#55578 fail-closed).", pinned_session_id,
-            )
+        verdict, pinned_session_id, pinned_row = await self._resolve_delegate_completion_owner(pinned_session_id)
+        if verdict != "deliver":
             return None
-        # Delegate rows are execution transcripts, not gateway route owners. A process completion can
-        # be stamped with the child session id even though the human-facing conversation belongs to
-        # `_delegate_from`. Follow that durable provenance before any route verification or mutation;
-        # otherwise switch_session() can end the real parent and rebind the platform chat to an
-        # internal child (#92611).
-        #
-        # Real nesting is bounded by delegation.max_spawn_depth (default 2), so the hop cap only
-        # guards a corrupt/hand-edited chain: without it a single completion event could fan out
-        # into hundreds of sequential get_session() reads before terminating.
-        delegate_chain: set[str] = set()
-        for _ in range(_MAX_DELEGATE_PROVENANCE_HOPS + 1):
-            if pinned_session_id in delegate_chain:
-                logger.warning(
-                    "Async-delegation completion has cyclic delegate provenance at session %s; "
-                    "dropping injection (#92611).", pinned_session_id,
-                )
-                return None
-            delegate_chain.add(pinned_session_id)
-            model_config = pinned_row.get("model_config")
-            if isinstance(model_config, str):
-                try:
-                    model_config = json.loads(model_config)
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "Async-delegation completion has malformed model_config for session %s; "
-                        "dropping injection (#92611).", pinned_session_id,
-                    )
-                    return None
-            if model_config is not None and not isinstance(model_config, dict):
-                logger.warning(
-                    "Async-delegation completion has non-object model_config for session %s; "
-                    "dropping injection (#92611).", pinned_session_id,
-                )
-                return None
-            if not isinstance(model_config, dict):
-                model_config = {}
-            delegate_parent_id = str(model_config.get("_delegate_from") or "").strip()
-            if not delegate_parent_id:
-                break
-            try:
-                delegate_parent_row = await session_db.get_session(delegate_parent_id)
-            except Exception:
-                delegate_parent_row = None
-            if delegate_parent_row is None:
-                logger.warning(
-                    "Async-delegation completion has missing delegate parent %s for child %s; "
-                    "dropping injection (#92611).", delegate_parent_id, pinned_session_id,
-                )
-                return None
-            pinned_session_id = delegate_parent_id
-            pinned_row = delegate_parent_row
-        else:
-            logger.warning(
-                "Async-delegation completion exceeded %d delegate provenance hops (last session %s); "
-                "dropping injection (#92611).", _MAX_DELEGATE_PROVENANCE_HOPS, pinned_session_id,
-            )
-            return None
+        assert pinned_row is not None
         target_session_id = pinned_session_id
         follows_compression = False
         if pinned_row.get("ended_at"):
@@ -1481,16 +1466,11 @@ class GatewayNotificationsMixin:
         ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
         rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; release the claim)."""
         from gateway.run import _USER_BOUNDARY_END_REASONS
+        verdict, parent_session_id, parent = await self._resolve_delegate_completion_owner(parent_session_id)
+        if verdict != "deliver":
+            return verdict
         session_db = getattr(self, "_session_db", None)
-        if session_db is None:
-            return "retry"
-        try:
-            parent = await session_db.get_session(parent_session_id)
-        except Exception:
-            logger.debug("Async-completion pre-flight parent lookup failed for %s", parent_session_id, exc_info=True)
-            return "retry"
-        if parent is None:
-            return "terminal"
+        assert parent is not None and session_db is not None
         if not parent.get("ended_at"):
             return "deliver"
         end_reason = str(parent.get("end_reason") or "")
@@ -1609,9 +1589,9 @@ class GatewayNotificationsMixin:
                 )
             claim.proceed = False
         elif verdict == "retry":
-            # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
+            # No adapter admission happened, so transient owner uncertainty must not spend a claim attempt.
             if claim.claim_id:
-                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
+                self._settle_durable_claim("defer", claim.delegation_id, claim.claim_id)
             claim.proceed, claim.early_result = False, False
         return claim
 
